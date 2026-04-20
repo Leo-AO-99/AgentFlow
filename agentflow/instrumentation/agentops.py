@@ -29,19 +29,39 @@ def _patch_new_agentops():
 
     def _handle_chat_attributes_with_tokens(args=None, kwargs=None, return_value=None, **kws):
         attributes = _original_handle_chat_attributes(args=args, kwargs=kwargs, return_value=return_value, **kws)
-        if hasattr(return_value, "prompt_token_ids"):
-            attributes["prompt_token_ids"] = list(return_value.prompt_token_ids)
-        if hasattr(return_value, "response_token_ids"):
-            attributes["response_token_ids"] = list(return_value.response_token_ids[0])
 
-        # For LiteLLM, response is a openai._legacy_response.LegacyAPIResponse
-        if hasattr(return_value, "http_response") and hasattr(return_value.http_response, "json"):
+        prompt_token_ids = None
+        response_token_ids = None
+
+        # Path 1: direct attribute (openai 1.x / vLLM response object)
+        if hasattr(return_value, "prompt_token_ids"):
+            prompt_token_ids = return_value.prompt_token_ids
+        if hasattr(return_value, "response_token_ids"):
+            response_token_ids = return_value.response_token_ids
+
+        # Path 2: model_extra dict (openai 2.x stores unknown vLLM fields here)
+        if (prompt_token_ids is None
+                and hasattr(return_value, "model_extra")
+                and isinstance(return_value.model_extra, dict)):
+            prompt_token_ids = return_value.model_extra.get("prompt_token_ids")
+            response_token_ids = return_value.model_extra.get("response_token_ids")
+
+        # Path 3: LiteLLM LegacyAPIResponse
+        if prompt_token_ids is None and hasattr(return_value, "http_response") and hasattr(return_value.http_response, "json"):
             json_data = return_value.http_response.json()
             if isinstance(json_data, dict):
-                if "prompt_token_ids" in json_data:
-                    attributes["prompt_token_ids"] = list(json_data["prompt_token_ids"])
-                if "response_token_ids" in json_data:
-                    attributes["response_token_ids"] = list(json_data["response_token_ids"][0])
+                prompt_token_ids = json_data.get("prompt_token_ids")
+                response_token_ids = json_data.get("response_token_ids")
+
+        if prompt_token_ids is not None:
+            attributes["prompt_token_ids"] = list(prompt_token_ids)
+        if response_token_ids is not None:
+            # response_token_ids is [[token, ...]] — take the first (only) sequence
+            if isinstance(response_token_ids, (list, tuple)) and len(response_token_ids) > 0:
+                inner = response_token_ids[0]
+                attributes["response_token_ids"] = list(inner) if not isinstance(inner, int) else list(response_token_ids)
+            else:
+                attributes["response_token_ids"] = list(response_token_ids)
 
         return attributes
 
@@ -108,11 +128,65 @@ def _unpatch_old_agentops():
         logger.info("Unpatched earlier version of agentops using _handle_response")
 
 
+def _create_openai_compat_shims():
+    """Create openai 2.x compatibility shims for agentops 0.4.x.
+
+    agentops 0.4.x still references several openai 1.x internal modules that
+    were removed in openai 2.x:
+      - openai.resources.beta.chat  (removed; promoted to openai.resources.chat)
+      - openai.resources._legacy_response  (removed internal module)
+
+    We create thin shims / stubs so that agentops imports succeed without errors.
+    """
+    import sys
+    import types
+
+    # --- Shim 1: openai.resources.beta.chat ---
+    if "openai.resources.beta.chat" not in sys.modules:
+        try:
+            import openai.resources.chat as _chat
+
+            if "openai.resources.beta" not in sys.modules:
+                import openai.resources as _res
+                _beta = types.ModuleType("openai.resources.beta")
+                sys.modules["openai.resources.beta"] = _beta
+                setattr(_res, "beta", _beta)
+
+            _beta = sys.modules["openai.resources.beta"]
+            sys.modules["openai.resources.beta.chat"] = _chat
+            setattr(_beta, "chat", _chat)
+            logger.info("Created openai.resources.beta.chat shim for openai 2.x compatibility")
+        except Exception as exc:
+            logger.warning(f"Could not create openai.resources.beta.chat shim: {exc}")
+
+    # --- Shim 2: openai.resources._legacy_response ---
+    # agentops stream_wrapper imports this removed module; stub it out so the
+    # import succeeds (the wrapper will fail gracefully when it actually tries
+    # to use it, but that code path isn't exercised for non-streaming calls).
+    if "openai.resources._legacy_response" not in sys.modules:
+        try:
+            import openai.resources as _res_mod
+            _legacy = types.ModuleType("openai.resources._legacy_response")
+            # Provide a no-op LegacyAPIResponse class so attribute lookups work
+            class LegacyAPIResponse:
+                pass
+            _legacy.LegacyAPIResponse = LegacyAPIResponse
+            sys.modules["openai.resources._legacy_response"] = _legacy
+            setattr(_res_mod, "_legacy_response", _legacy)
+            logger.info("Created openai.resources._legacy_response stub for openai 2.x compatibility")
+        except Exception as exc:
+            logger.warning(f"Could not create openai.resources._legacy_response stub: {exc}")
+
+
 def instrument_agentops():
     """
     Instrument agentops to capture token IDs.
     Automatically detects and uses the appropriate patching method based on the installed agentops version.
     """
+    # Create openai 2.x compatibility shims BEFORE agentops initialises its
+    # OpenAI instrumentor, which still looks for openai 1.x internal modules.
+    _create_openai_compat_shims()
+
     # Try newest version first (tested for 0.4.16)
     try:
         return _patch_new_agentops()

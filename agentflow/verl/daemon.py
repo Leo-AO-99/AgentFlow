@@ -448,8 +448,9 @@ class AgentModeDaemon:
                 print(f"Timeout after {elapsed/60:.1f} minutes. Completed {completion_rate:.1%} ({completed_count}/{original_task_count})")
                 break
 
-            # No progress timeout (5 minutes for training, 3 minutes for validation)
-            no_progress_limit = 300 if self.is_train else 180
+            # No progress timeout (5 minutes for training, 10 minutes for validation)
+            # Validation tasks (AIME24) take ~150s each; 3 min was too short for first result.
+            no_progress_limit = 300 if self.is_train else 600
             if (current_time - last_progress_time) > no_progress_limit:
                 print(f"No progress for {no_progress_limit/60:.1f} minutes. Completed {completion_rate:.1%}")
                 if not self.is_train or completion_rate >= 0.5:  # Accept if validation or >50% training done

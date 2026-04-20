@@ -127,6 +127,21 @@ def main(output_dir='./data/train'):
         return
 
     print("\n--- 3. Concatenating datasets ---")
+    # Cast both datasets to a common schema to avoid large_string vs string mismatches
+    from datasets import Features, Value
+    common_features = Features({
+        "question": Value("string"),
+        "id": Value("int64"),
+        "chain": Value("string"),
+        "result": Value("string"),
+        "source": Value("string"),
+        "extra_info": {
+            "ground_truth": Value("string"),
+            "idx": Value("int64"),
+        },
+    })
+    processed_nq = processed_nq.cast(common_features)
+    processed_math = processed_math.cast(common_features)
     combined_dataset = concatenate_datasets([processed_nq, processed_math])
     
     # Add a shuffle step here

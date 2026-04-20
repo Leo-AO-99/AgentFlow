@@ -5,18 +5,13 @@ from pydantic import BaseModel
 
 from agentflow.tools.base import BaseTool
 from agentflow.engine.factory import create_llm_engine
-from agentflow.tools.web_search.tool import Web_Search_Tool
 
-# from web_rag import Web_Search_Tool
-# from agentflow.tools.web_search.tool import Web_Search_Tool # NOTE: Shall be used in the future
-
-# from utilis import select_relevant_queries
-
-from agentflow.tools.base import BaseTool
-from agentflow.engine.factory import create_llm_engine
+# Web_Search_Tool is imported lazily inside execute() to avoid being picked up
+# by initializer.py's inspect.getmembers() scan, which would spuriously register
+# Web_RAG_Search_Tool in the toolbox even when it's not in ENABLE_TOOLS.
 
 # Tool name mapping - this defines the external name for this tool
-TOOL_NAME = "Wikipedia_RAG_Search_Tool"
+TOOL_NAME = "Wikipedia_Search_Tool"
 
 LIMITATION = f"""
 {TOOL_NAME} has the following limitations:
@@ -142,6 +137,7 @@ class Wikipedia_Search_Tool(BaseTool):
                 "best_practice": BEST_PRACTICE
             }
         )
+        self.model_string = model_string
         self.llm_engine = create_llm_engine(model_string=model_string, temperature=0.0, top_p=1.0, frequency_penalty=0.0, presence_penalty=0.0)
 
     def _get_wikipedia_url(self, query):
@@ -229,7 +225,9 @@ class Wikipedia_Search_Tool(BaseTool):
         other_pages = [search_results[i] for i in range(len(search_results)) if i not in matched_query_ids]
 
         # For each relevant page, get detailed information using Web RAG
+        # Lazy import to avoid being picked up by initializer.py's inspect.getmembers()
         try:
+            from agentflow.tools.web_search.tool import Web_Search_Tool
             web_rag_tool = Web_Search_Tool(model_string=self.model_string)
         except Exception as e:
             print(f"Error creating Web RAG tool: {e}")

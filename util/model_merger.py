@@ -1,10 +1,9 @@
 from typing import List, Tuple, Dict
 import re
 import os
+import shutil
 import torch
 import argparse
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
-# Use ThreadPoolExecutor for I/O within a process, and ProcessPoolExecutor for parallelizing across directories
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from torch.distributed._tensor import DTensor, Shard, Placement
 
@@ -45,13 +44,15 @@ def merge_checkpoint_directory(local_dir: str, hf_upload_path: str = None):
         with ThreadPoolExecutor(max_workers=min(64, os.cpu_count())) as executor:
             model_state_dict_lst = list(executor.map(load_rank, range(world_size)))
 
-        # Extract device_mesh from first DTensor
-        pivot_key = next(k for k, v in model_state_dict_lst[0].items() if isinstance(v, DTensor))
-        device_mesh = model_state_dict_lst[0][pivot_key].device_mesh
-        assert device_mesh.mesh_dim_names == ('fsdp',), "Only FSDP supported"
-
-        total_shards = device_mesh.mesh.size(0)
-        assert total_shards == world_size
+        # Extract device_mesh from first DTensor (absent on single-GPU runs)
+        pivot_key = next(
+            (k for k, v in model_state_dict_lst[0].items() if isinstance(v, DTensor)), None
+        )
+        if pivot_key is not None:
+            device_mesh = model_state_dict_lst[0][pivot_key].device_mesh
+            assert device_mesh.mesh_dim_names == ('fsdp',), "Only FSDP supported"
+            total_shards = device_mesh.mesh.size(0)
+            assert total_shards == world_size
 
         merged_state_dict = {}
         param_placements = {}

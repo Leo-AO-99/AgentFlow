@@ -66,10 +66,7 @@ class Executor:
         # Store the tool instances cache
         self.tool_instances_cache = tool_instances_cache if tool_instances_cache is not None else {}
 
-        if base_url is not None:
-            self.llm_generate_tool_command = create_llm_engine(model_string=self.llm_engine_name, is_multimodal=False, base_url=self.base_url, temperature = self.temperature)
-        else:
-            self.llm_generate_tool_command = create_llm_engine(model_string=self.llm_engine_name, is_multimodal=False, temperature = self.temperature)
+        self.llm_generate_tool_command = create_llm_engine(model_string=self.llm_engine_name, is_multimodal=False, base_url=self.base_url, temperature = self.temperature)
     
     def set_query_cache_dir(self, query_cache_dir):
         if query_cache_dir:

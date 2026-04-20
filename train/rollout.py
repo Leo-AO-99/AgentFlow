@@ -6,10 +6,11 @@ from typing import Any, Optional
 
 import sympy
 
-from autogen_ext.tools.mcp import StdioServerParams
 from agentflow import Trainer, LitAgent, NamedResources, LLM, reward, configure_logger, DevTaskLoader
+from agentflow.types import Rollout as RolloutResult, Triplet
 
-from agentflow.solver import construct_solver
+from agentflow.agentflow.solver import construct_solver
+from agentflow.agentflow.models.utils import make_json_serializable_truncated
 from datetime import datetime
 import uuid, json
 from filelock import FileLock
@@ -38,10 +39,10 @@ class AgentFlowRollout:
     def __init__(
         self,
         resources: NamedResources,
-        llm_engine_name: str = "gpt-4o",
+        llm_engine_name: str = "gpt-4o-mini",
         enabled_tools: list[str] = ["Base_Generator_Tool"],
         tool_engine: list[str] = ["Default"],
-        model_engine: list[str] = ["trainable", "gpt-4o", "gpt-4o"],  # [planner_main, planner_fixed, executor]
+        model_engine: list[str] = ["trainable", "gpt-4o-mini", "gpt-4o-mini", "gpt-4o-mini"],  # [planner_main, planner_fixed, verifier, executor]
         output_types: str = "final,direct",
         max_steps: int = 3,
         max_time: int = 500,
@@ -131,8 +132,8 @@ class Rollout(LitAgent):
     rollout_n: int = 8,
     batch_size: int = 16,
     enabled_tools: list[str] =["Base_Generator_Tool","Python_Coder_Tool","Google_Search_Tool","Wikipedia_Search_Tool"],
-    tool_engine: list[str] = ["gpt-4o","gpt-4o","Default","Default"],
-    model_engine: list[str] = ["trainable", "gpt-4o", "gpt-4o"],  # [planner_main, planner_fixed, executor]
+    tool_engine: list[str] = ["gpt-4o-mini","gpt-4o-mini","Default","Default"],
+    model_engine: list[str] = ["trainable", "gpt-4o-mini", "gpt-4o-mini", "gpt-4o-mini"],  # [planner_main, planner_fixed, verifier, executor]
     max_steps: int = 3,
     max_tokens: int = 2048,
     train_temperature: float = 0.7,
@@ -175,23 +176,136 @@ class Rollout(LitAgent):
         self.max_steps = max_steps
         self.max_tokens = max_tokens
 
+        # Tokenizer for building Triplets with token_ids (loaded lazily in _initialize_run_once)
+        self.tokenizer = None
+
+    def _build_rollout_with_token_ids(self, result: dict, reward_value: float, rollout_id: str) -> RolloutResult:
+        """Build a Rollout with Triplets whose token_ids are obtained by tokenizing the
+        prompt/response text pairs that the solver recorded in result under the keys
+        'action_predictor_N_prompt' / 'action_predictor_N_response'."""
+        triplets = []
+
+        if self.tokenizer is not None:
+            step_count = 1
+            while True:
+                prompt_key = f"action_predictor_{step_count}_prompt"
+                response_key = f"action_predictor_{step_count}_response"
+
+                if prompt_key not in result or response_key not in result:
+                    break
+
+                prompt_text = result.get(prompt_key) or ""
+                response_text = result.get(response_key) or ""
+
+                # Skip steps where LLM returned an error dict (ChatVLLM wraps errors as dicts)
+                if isinstance(response_text, dict) or str(response_text).startswith("{'error'"):
+                    step_count += 1
+                    continue
+
+                prompt_text = str(prompt_text).strip()
+                response_text = str(response_text).strip()
+
+                if not prompt_text or not response_text:
+                    step_count += 1
+                    continue
+
+                try:
+                    # Construct the same message format ChatVLLM sends to vLLM
+                    messages = [
+                        {"role": "system", "content": "You are a helpful, creative, and smart assistant."},
+                        {"role": "user", "content": prompt_text},
+                    ]
+                    prompt_ids = self.tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True, tokenize=True
+                    )
+                    # transformers ≥5.x may return a BatchEncoding dict; extract input_ids
+                    if isinstance(prompt_ids, dict):
+                        prompt_ids = prompt_ids["input_ids"]
+                    elif hasattr(prompt_ids, "input_ids"):
+                        prompt_ids = prompt_ids.input_ids
+                except Exception as _e:
+                    print(f"[Warning] Chat-template failed at step {step_count}: {_e}. Using basic encode.")
+                    prompt_ids = self.tokenizer.encode(prompt_text)
+
+                try:
+                    response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
+                except Exception as _e:
+                    print(f"[Warning] Response tokenization failed at step {step_count}: {_e}")
+                    response_ids = []
+
+                if prompt_ids and response_ids:
+                    triplets.append(Triplet(
+                        prompt={"token_ids": list(prompt_ids)},
+                        response={"token_ids": list(response_ids)},
+                        reward=None,
+                    ))
+
+                step_count += 1
+
+        # Attach the final reward to the last triplet
+        if triplets:
+            triplets[-1] = triplets[-1].model_copy(update={"reward": reward_value})
+
+        return RolloutResult(
+            rollout_id=rollout_id,
+            final_reward=reward_value,
+            triplets=triplets if triplets else None,
+        )
+
+    @staticmethod
+    def _normalize_task(task: Any):
+        """Extract question and ground_truth from different task data formats.
+
+        Supports two formats:
+        - QA format (step5): task["question"], task["result"]
+        - MBPP format (step6): task["prompt"] (messages list), task["reward_model"]["ground_truth"]
+        """
+        if "question" in task:
+            question = task["question"]
+            ground_truth = task.get("result", "")
+        else:
+            # MBPP / verl parquet format: prompt is a list of chat messages
+            prompt_messages = task.get("prompt", [])
+            if isinstance(prompt_messages, list):
+                user_msgs = [m["content"] for m in prompt_messages if isinstance(m, dict) and m.get("role") == "user"]
+                question = user_msgs[-1] if user_msgs else ""
+            else:
+                question = str(prompt_messages)
+            reward_model = task.get("reward_model", {})
+            if not isinstance(reward_model, dict):
+                reward_model = {}
+            ground_truth = reward_model.get("ground_truth", "")
+        return question, ground_truth
+
     async def _solve_and_evaluate(self, rollout: AgentFlowRollout, task: Any, step_n: int, val: bool = False):
         """A helper function to run the agent, parse the result, and evaluate it."""
         result = {}
+
+        question, ground_truth = self._normalize_task(task)
+
+        # Detect code-execution reward mode (set via REWARD_FUNCTION env var)
+        use_code_execution = (os.environ.get("REWARD_FUNCTION", "") == "code_execution")
+
         try:
-            output_format = "When ready, output the final answer enclosed in <answer> and </answer> tags. Do not generate any content after the </answer> tag."
-            prompt = task["question"] + " " + output_format
-            # prompt = task["question"]
+            if use_code_execution:
+                prompt = question  # No <answer> instruction; expect ```python``` block
+            else:
+                output_format = "When ready, output the final answer enclosed in <answer> and </answer> tags. Do not generate any content after the </answer> tag."
+                prompt = question + " " + output_format
+
             result = rollout.solve(question=prompt)
-            
+
             # Safely check for and extract the final answer
             if "direct_output" in result and result["direct_output"]:
                 final_output = result["direct_output"]
-                all_matches = re.findall(r"<answer>(.*?)</answer>", final_output, re.DOTALL)
-                if all_matches:
-                    answer = all_matches[-1].strip()
+                if use_code_execution:
+                    answer = final_output  # Pass full output to code execution scorer
                 else:
-                    answer = final_output
+                    all_matches = re.findall(r"<answer>(.*?)</answer>", final_output, re.DOTALL)
+                    if all_matches:
+                        answer = all_matches[-1].strip()
+                    else:
+                        answer = final_output
             else:
                 print("Warning: Result has no direct_output or direct_output is empty.")
                 answer = "None"
@@ -199,23 +313,36 @@ class Rollout(LitAgent):
             print(f"Failure during agent execution: {str(e)}. Defaulting to 'None'.")
             answer = "None"
 
-        # Evaluate the answer against the ground truth
-        reward_value = await eval(task["question"], str(task["result"]), answer, val)  # reward is tracked with the decorator
-        print("answer: {} ground_truth: {} reward: {}".format(answer, task["result"], reward_value))
+        # Evaluate using the appropriate scorer
+        if use_code_execution:
+            try:
+                from utils import compute_score_codegen
+                reward_value = float(compute_score_codegen(question, ground_truth, answer))
+            except Exception as e:
+                print(f"Code execution scoring failed: {e}. Defaulting to 0.0.")
+                reward_value = 0.0
+        else:
+            reward_value = await eval(question, str(ground_truth), answer, val)
 
-        idx = task.get("extra_info", {}).get("idx", "unknown_idx")
+        print("answer: {} ground_truth: {} reward: {}".format(answer, ground_truth, reward_value))
+
+        # Support both "idx" (QA format) and "index" (MBPP format) keys
+        extra_info = task.get("extra_info", {})
+        if not isinstance(extra_info, dict):
+            extra_info = {}
+        idx = extra_info.get("idx", extra_info.get("index", "unknown_idx"))
 
         rollout_data = {
-            "step": task.get("step", ""), # TODO: check whether it can be solved
+            "step": task.get("step", ""),
             "idx": idx,
             "id": task.get("id", ""),
-            "prompt": task["question"],
-            "model":rollout.llm_engine,
-            "tools":self.tools,
-            "groundtruth": task.get("extra_info", {}).get("groundtruth", task["result"]),
+            "prompt": question,
+            "model": rollout.llm_engine,
+            "tools": self.tools,
+            "groundtruth": make_json_serializable_truncated(ground_truth),
             "answer_extracted": answer,
             "reward": reward_value,
-            "total_result":result,
+            "total_result": result,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -244,6 +371,7 @@ class Rollout(LitAgent):
 
         print(f"Rollout data saved to: {save_path}")
 
+        return reward_value, result
 
     async def _initialize_run_once(self, resources: NamedResources):
         """
@@ -275,12 +403,23 @@ class Rollout(LitAgent):
         self.rollout_dir = final_rollout_dir
         self.train_rollout_dir = os.path.join(self.rollout_dir, "train")
         self.val_rollout_dir = os.path.join(self.rollout_dir, "validation")
-        
+
         os.makedirs(self.train_rollout_dir, exist_ok=True)
         os.makedirs(self.val_rollout_dir, exist_ok=True)
-        
+
         self.train_lock_file = os.path.join(self.train_rollout_dir, ".train.lock")
         self.val_lock_file = os.path.join(self.val_rollout_dir, ".val.lock")
+
+        # Load tokenizer for building Triplets with real token_ids
+        if self.tokenizer is None:
+            model_name = resources.get("main_llm").model
+            try:
+                from transformers import AutoTokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+                print(f"[Rollout Init] Loaded tokenizer for '{model_name}'")
+            except Exception as _tok_err:
+                print(f"[Rollout Init] WARNING: Could not load tokenizer for '{model_name}': {_tok_err}. "
+                      "Token IDs will be empty — training batch may be invalid.")
         
     async def training_rollout_async(self, task: Any, rollout_id: str, resources: NamedResources, val: bool = False) -> Any:
         await self._initialize_run_once(resources)
@@ -320,9 +459,8 @@ class Rollout(LitAgent):
             
             step_n = current_step_n
 
-        await self._solve_and_evaluate(self.training_agent, task, step_n, val)
-
-
+        reward_value, result = await self._solve_and_evaluate(self.training_agent, task, step_n, val)
+        return self._build_rollout_with_token_ids(result, reward_value, rollout_id)
 
     async def validation_rollout_async(self, task: Any, rollout_id: str, resources: NamedResources, val: bool = True) -> Any:
         await self._initialize_run_once(resources)
@@ -357,13 +495,20 @@ class Rollout(LitAgent):
             self.val_step_n = current_train_step
             print(f"Validation run started. Synchronizing with training progress. Saving results to validation step folder: {self.val_step_n}")
 
-        await self._solve_and_evaluate(self.validation_agent, task, self.val_step_n, val)
+        reward_value, result = await self._solve_and_evaluate(self.validation_agent, task, self.val_step_n, val)
+        return self._build_rollout_with_token_ids(result, reward_value, rollout_id)
 
 if __name__ == "__main__":
+    import argparse
     from util.parse_config import get_values_from_yaml
     from util.port_cleanup import kill_process_on_port
     from util.get_pub_ip import get_public_ip_with_fallback
     from pprint import pprint
+
+    _parser = argparse.ArgumentParser()
+    _parser.add_argument("--config", default="train/config.yaml",
+                         help="Path to YAML config file (defaults to train/config.yaml)")
+    _args, _ = _parser.parse_known_args()
 
     server_public_ip = get_public_ip_with_fallback()
 
@@ -384,7 +529,7 @@ if __name__ == "__main__":
         "AGENT_MAX_TIMEOUT"
     ]
 
-    config_file = 'train/config.yaml'
+    config_file = _args.config
 
     values = get_values_from_yaml(config_file, keys_to_retrieve)
 
@@ -406,6 +551,12 @@ if __name__ == "__main__":
     }
 
     config_dict = dict(zip(config_keys_map.values(), values))
+
+    # Provide a default for TOOL_ENGINE when it is missing from the config
+    if config_dict.get("tool_engine") is None:
+        n_tools = len(config_dict.get("enabled_tools") or [])
+        config_dict["tool_engine"] = ["gpt-4o-mini"] * n_tools
+        print(f"[INFO] TOOL_ENGINE not found in config; defaulting to {config_dict['tool_engine']}")
 
     port_to_use = config_dict.get("port")
     if port_to_use:

@@ -91,7 +91,7 @@ def find_most_similar_candidate(query: str, candidates: list) -> str:
 
 class ResultScorer:
     def __init__(self, llm_engine=None):
-        self.llm_engine = llm_engine or ChatOpenAI(model_string="gpt-4o", is_multimodal=False, enable_cache=True)
+        self.llm_engine = llm_engine or ChatOpenAI(model_string="gpt-4o-mini", is_multimodal=False, enable_cache=True)
         print(f"\nLocal OpenAI engine {self.llm_engine.model_string} initialized.\n")
 
     def answer_verification_twostage(self, question, response, correct_answer, choices):

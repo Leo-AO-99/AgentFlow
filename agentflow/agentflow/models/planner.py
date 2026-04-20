@@ -19,8 +19,12 @@ class Planner:
         self.llm_engine_fixed_name = llm_engine_fixed_name
         self.is_multimodal = is_multimodal
         # self.llm_engine_mm = create_llm_engine(model_string=llm_engine_name, is_multimodal=False, base_url=base_url, temperature = temperature)
-        self.llm_engine_fixed = create_llm_engine(model_string=llm_engine_fixed_name, is_multimodal=False, temperature = temperature)
-        self.llm_engine = create_llm_engine(model_string=llm_engine_name, is_multimodal=False, base_url=base_url, temperature = temperature)
+        # Only pass base_url to the fixed engine if it's the same model as the main engine
+        # (i.e., both are trainable). Otherwise pass None so ChatVLLM falls back to
+        # the VLLM_BASE_URL env var (e.g., Portkey gateway URL).
+        fixed_base_url = base_url if llm_engine_fixed_name == llm_engine_name else None
+        self.llm_engine_fixed = create_llm_engine(model_string=llm_engine_fixed_name, is_multimodal=False, base_url=fixed_base_url, temperature=temperature)
+        self.llm_engine = create_llm_engine(model_string=llm_engine_name, is_multimodal=False, base_url=base_url, temperature=temperature)
         self.toolbox_metadata = toolbox_metadata if toolbox_metadata is not None else {}
         self.available_tools = available_tools if available_tools is not None else []
 
@@ -163,6 +167,8 @@ Be biref and precise with insight.
                 tool_name = response.tool_name.strip()
             else:
                 print("arielg 2")
+                if not isinstance(response, str):
+                    raise TypeError(f"Expected str response, got {type(response).__name__}: {response!r}")
                 text = response.replace("**", "")
 
                 # Pattern to match the exact format

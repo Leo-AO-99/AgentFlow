@@ -111,8 +111,9 @@ class AgentRunner(ParallelWorkerBase):
                 trace = [json.loads(readable_span.to_json()) for readable_span in spans]
                 trace_spans = spans
 
-        # Always extract triplets from the trace using TripletExporter
-        if trace_spans:
+        # Extract triplets from the trace using TripletExporter,
+        # but only when no triplets were already provided (e.g. via a returned Rollout object).
+        if trace_spans and triplets is None:
             triplets = self.triplet_exporter.export(trace_spans)
 
         # If the agent has triplets, use the last one for final reward if not set
@@ -217,6 +218,8 @@ class AgentRunner(ParallelWorkerBase):
 
         rollout_obj = Rollout(rollout_id=task.rollout_id)  # Default empty rollout
 
+        question_preview = str(task.input.get("question", ""))[:80] if isinstance(task.input, dict) else str(task.input)[:80]
+        logger.info(f"{self._log_prefix(rollout_id)} Starting {task.mode} rollout. Q: {question_preview!r}")
         try:
             with self.tracer.trace_context(name=f"rollout_{rollout_id}"):
                 start_time = time.time()
@@ -229,14 +232,15 @@ class AgentRunner(ParallelWorkerBase):
                 end_time = time.time()
                 logger.info(
                     f"{self._log_prefix(rollout_id)} Completed in "
-                    f"{end_time - start_time:.2f}s. Reward: {rollout_obj.final_reward}"
+                    f"{end_time - start_time:.2f}s. Reward: {rollout_obj.final_reward} "
+                    f"triplets: {len(rollout_obj.triplets) if rollout_obj.triplets else 0}"
                 )
         except Exception:
             logger.exception(f"{self._log_prefix(rollout_id)} Exception during rollout.")
         finally:
-            print(f"[DEBUG] Posting rollout: {rollout_obj}")
+            logger.info(f"{self._log_prefix(rollout_id)} Posting rollout to server...")
             response = await self.client.post_rollout_async(rollout_obj)
-            print(f"[DEBUG] Post rollout response: {response}")
+            logger.info(f"{self._log_prefix(rollout_id)} Post response: {response}")
 
         return True
 

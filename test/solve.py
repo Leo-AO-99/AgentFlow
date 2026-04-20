@@ -399,7 +399,7 @@ def main(args):
     )
 
     # Instantiate Verifier
-    from agentflow.models.verifier import Verifier
+    from agentflow.agentflow.models.verifier import Verifier
     verifier = Verifier(
         llm_engine_name=verifier_engine,
         llm_engine_fixed_name=planner_fixed_engine,

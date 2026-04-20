@@ -58,6 +58,9 @@ class AgentFlowClient:
                 async with session.get(url, headers=self._default_headers) as resp:
                     resp.raise_for_status()
                     return await resp.json()
+            except aiohttp.ClientConnectorError as e:
+                logger.debug(f"[Client] Cannot connect to server ({url}): {e}")
+                return None
             except Exception as e:
                 logger.debug(f"Async GET request failed for {url}: {e}")
                 return None
@@ -89,15 +92,36 @@ class AgentFlowClient:
             A Task object containing the task details.
         """
         url = urllib.parse.urljoin(self.endpoint, self._next_task_uri)
+        poll_count = 0
+        start_time = time.time()
         while True:
             response = await self._request_json_async(url)
             if response:
                 task_if_any = TaskIfAny.model_validate(response)
                 if task_if_any.is_available and task_if_any.task:
                     self.task_count += 1
-                    logger.info(f"[Task {self.task_count} Received] ID: {task_if_any.task.rollout_id}")
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"[Task {self.task_count} Received] ID: {task_if_any.task.rollout_id} "
+                        f"mode={task_if_any.task.mode} (waited {elapsed:.1f}s, {poll_count} polls)"
+                    )
                     return task_if_any.task
-            logger.debug(f"No task available yet. Retrying in {self.poll_interval} seconds...")
+                # Server is reachable but queue is empty
+                poll_count += 1
+                if poll_count == 1 or poll_count % 12 == 0:  # log at start then every ~60s
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"[Client] Server reachable but no task yet "
+                        f"(poll #{poll_count}, {elapsed:.0f}s elapsed)"
+                    )
+            else:
+                poll_count += 1
+                if poll_count == 1 or poll_count % 12 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"[Client] Waiting for server to come up "
+                        f"(poll #{poll_count}, {elapsed:.0f}s elapsed)"
+                    )
             await asyncio.sleep(self.poll_interval)
 
     async def get_resources_by_id_async(self, resource_id: str) -> Optional[ResourcesUpdate]:
@@ -163,6 +187,9 @@ class AgentFlowClient:
             response = requests.get(url, timeout=self.timeout, headers=self._default_headers)
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(f"[Client] Cannot connect to server ({url}): {e}")
+            return None
         except requests.exceptions.RequestException as e:
             logger.debug(f"Sync GET request failed for {url}: {e}")
             return None
@@ -192,15 +219,35 @@ class AgentFlowClient:
             A Task object containing the task details, including the required `resources_id`.
         """
         url = urllib.parse.urljoin(self.endpoint, self._next_task_uri)
+        poll_count = 0
+        start_time = time.time()
         while True:
             response = self._request_json(url)
             if response:
                 task_if_any = TaskIfAny.model_validate(response)
                 if task_if_any.is_available and task_if_any.task:
                     self.task_count += 1
-                    logger.info(f"[Task {self.task_count} Received] ID: {task_if_any.task.rollout_id}")
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"[Task {self.task_count} Received] ID: {task_if_any.task.rollout_id} "
+                        f"mode={task_if_any.task.mode} (waited {elapsed:.1f}s, {poll_count} polls)"
+                    )
                     return task_if_any.task
-            logger.debug(f"No task available yet. Retrying in {self.poll_interval} seconds...")
+                poll_count += 1
+                if poll_count == 1 or poll_count % 12 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"[Client] Server reachable but no task yet "
+                        f"(poll #{poll_count}, {elapsed:.0f}s elapsed)"
+                    )
+            else:
+                poll_count += 1
+                if poll_count == 1 or poll_count % 12 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"[Client] Waiting for server to come up "
+                        f"(poll #{poll_count}, {elapsed:.0f}s elapsed)"
+                    )
             time.sleep(self.poll_interval)
 
     def get_resources_by_id(self, resource_id: str) -> Optional[ResourcesUpdate]:
@@ -250,9 +297,7 @@ class AgentFlowClient:
         """
         url = urllib.parse.urljoin(self.endpoint, self._report_rollout_uri)
         payload = rollout.model_dump(mode="json")
-        response = self._post_json(url, payload)
-        print(f"[DEBUG] Post rollout response: {response}")
-        return response
+        return self._post_json(url, payload)
 
 
 class DevTaskLoader(AgentFlowClient):

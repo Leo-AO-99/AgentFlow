@@ -1,0 +1,109 @@
+# Step 5: Flow-GRPO training config for Qwen3.5-0.8B-Instruct with LoRA
+# Single L40S GPU (48 GB VRAM).
+#
+# Dev run:  timeout=1200 in modal_train.py, pass --dev flag
+# Full run: change timeout to 7200 and run without --dev
+
+env:
+  # OPENAI_API_KEY and WANDB_API_KEY come from Modal secret — do NOT set here
+  CUDA_VISIBLE_DEVICES: '0'
+  HYDRA_FULL_ERROR: 1
+  N_GPUS: 1
+  BASE_MODEL: 'Qwen/Qwen3.5-0.8B'
+  ROLLOUT_TP_SIZE: 1
+  EXPERIMENT_NAME: 'AgentFlow_Qwen3.5-0.8B_Step5'
+  PROJECT_NAME: 'AgentFlow_Step5'
+  BASE_DATA_DIR: '/runs/step5/data'
+  VERBOSITY: 'INFO'
+  N_WORKERS: 8
+  ENABLE_TOOLS: ["Base_Generator_Tool", "Python_Coder_Tool", "Wikipedia_Search_Tool"]
+  # Non-training modules use Qwen2.5-7B via Portkey→DeepInfra (same as step2).
+  # VLLM_BASE_URL=https://api.portkey.ai/v1 and VLLM_API_KEY=PORTKEY_API_KEY set in modal_train.py.
+  # The judge (compute_score in utils.py) uses gpt-4o-mini directly and is NOT affected.
+  TOOL_ENGINE: ["vllm-@deepinfra/Qwen/Qwen2.5-7B-Instruct", "vllm-@deepinfra/Qwen/Qwen2.5-7B-Instruct", "vllm-@deepinfra/Qwen/Qwen2.5-7B-Instruct"]
+  MODEL_ENGINE: ["trainable", "vllm-@deepinfra/Qwen/Qwen2.5-7B-Instruct", "vllm-@deepinfra/Qwen/Qwen2.5-7B-Instruct", "vllm-@deepinfra/Qwen/Qwen2.5-7B-Instruct"]
+  TOOL_STEPS: 3
+  TEST_TEMPERATURE: 0.0
+  TRAIN_TEMPERATURE: 0.7
+  OUTPUT_TYPE: "direct"
+  AGENT_MAX_TIMEOUT: 300
+
+python_args:
+  "+ray_init.num_cpus": 4
+  agentflow.port: 9999
+  algorithm.adv_estimator: 'grpo'
+
+  # Data (auto-generated in container, cached after first run)
+  data.train_files: '${BASE_DATA_DIR}/train/combined_train.parquet'
+  data.val_files: '${BASE_DATA_DIR}/val/aime24.parquet'
+  data.trust_remote_code: True
+
+  # Model
+  actor_rollout_ref.model.path: '${BASE_MODEL}'
+  actor_rollout_ref.model.trust_remote_code: True
+  actor_rollout_ref.rollout.tensor_model_parallel_size: '${ROLLOUT_TP_SIZE}'
+  trainer.n_gpus_per_node: '${N_GPUS}'
+
+  # LoRA (rank=64, alpha=128 as per RUNBOOK)
+  actor_rollout_ref.model.lora_rank: 64
+  actor_rollout_ref.model.lora_alpha: 128
+  actor_rollout_ref.model.target_modules: 'all-linear'
+
+  # Batch sizes tuned for 0.8B + LoRA on single L40S
+  data.train_batch_size: 8
+  actor_rollout_ref.rollout.n: 4
+  actor_rollout_ref.actor.ppo_mini_batch_size: 4
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu: 2
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu: 2
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu: 2
+
+  actor_rollout_ref.rollout.multi_turn.format: 'hermes'
+  data.max_prompt_length: 8192
+  data.max_response_length: 1024
+  data.truncation: 'truncate'
+
+  # Optimization
+  actor_rollout_ref.actor.optim.lr: 1e-5
+  actor_rollout_ref.model.use_remove_padding: True
+  actor_rollout_ref.actor.use_kl_loss: True
+  actor_rollout_ref.actor.kl_loss_coef: 0.001
+  actor_rollout_ref.actor.entropy_coeff: 0.0
+  actor_rollout_ref.actor.clip_ratio_low: 0.2
+  actor_rollout_ref.actor.clip_ratio_high: 0.3
+  actor_rollout_ref.model.enable_gradient_checkpointing: True
+  actor_rollout_ref.actor.fsdp_config.param_offload: False
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload: False
+
+  # Use sdpa (safe default; switch to flash_attention_2 once dev run confirms stability)
+  "+actor_rollout_ref.model.override_config.attn_implementation": 'sdpa'
+
+  # vLLM rollout
+  actor_rollout_ref.rollout.name: 'vllm'
+  actor_rollout_ref.rollout.gpu_memory_utilization: 0.4
+  # Disable CUDA graphs to prevent Triton MMU fault when FSDP and vLLM share GPU
+  actor_rollout_ref.rollout.enforce_eager: True
+  # Limit context to avoid enormous KV cache allocation (default 262144 causes CUDA issues)
+  actor_rollout_ref.rollout.max_model_len: 12288
+  # Keep KV cache always allocated — disable free_cache_engine to skip sleep/wake cycle
+  # (AgentFlow _wake_up_rollout is a no-op so KV cache would never be re-allocated after sleep)
+  actor_rollout_ref.rollout.free_cache_engine: False
+  # Load real model weights at vLLM startup from HF cache.
+  # Weight sync to vLLM happens after every update_actor() call via _sync_weights_to_rollout().
+  actor_rollout_ref.rollout.load_format: 'auto'
+
+  # Reference model
+  actor_rollout_ref.ref.fsdp_config.param_offload: False
+  algorithm.use_kl_in_reward: False
+
+  # Training schedule + checkpoint dir (volume-mounted, persists after container exit)
+  trainer.default_local_dir: '/runs/step5/checkpoints'
+  trainer.critic_warmup: 0
+  trainer.logger: ['console', 'wandb']
+  trainer.project_name: '${PROJECT_NAME}'
+  trainer.experiment_name: '${EXPERIMENT_NAME}'
+  trainer.nnodes: 1
+  trainer.save_freq: 2
+  trainer.test_freq: 2
+  trainer.total_epochs: 50
+  trainer.val_before_train: False
+  trainer.resume_mode: 'auto'

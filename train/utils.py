@@ -9,8 +9,8 @@ class AnswerVerification(BaseModel):
 
 try:
     llm_scorer_engine = ChatOpenAI(
-        model_string="gpt-4o", 
-        is_multimodal=False, 
+        model_string="gpt-4o-mini",
+        is_multimodal=False,
         enable_cache=True
     )
     print(f"\nLLM Scorer engine '{llm_scorer_engine.model_string}' initialized successfully.\n")

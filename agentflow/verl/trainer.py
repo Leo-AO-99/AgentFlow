@@ -63,6 +63,70 @@ class AgentFlowTrainer(RayPPOTrainer):
     4. Streamlined validation using agent_mode validation
     """
 
+    def __init__(self, *args, reward_fn=None, val_reward_fn=None, **kwargs):
+        # New verl removed reward_fn / val_reward_fn from RayPPOTrainer.__init__.
+        # We capture them here so they don't cause an unexpected-keyword-argument
+        # error, then store them as instance attributes for use in fit() / _train_step().
+        super().__init__(*args, **kwargs)
+        self.reward_fn = reward_fn
+        # val_reward_fn is used as a boolean guard: not None → run validation.
+        # _validate() in this class uses agent_mode_daemon, not val_reward_fn directly.
+        self.val_reward_fn = val_reward_fn if val_reward_fn is not None else True
+
+    def _sync_weights_to_rollout(self) -> None:
+        """Broadcast FSDP actor weights to the vLLM rollout server.
+
+        AgentFlow bypasses verl's generate_sequences() entirely — rollout is
+        done by external workers via the AgentFlow HTTP server.  This means the
+        normal FSDP→vLLM weight broadcast that happens inside
+        generate_sequences() never runs, so vLLM keeps load_format=dummy random
+        weights forever and every rollout produces garbage.
+
+        Fix: call checkpoint_manager.update_weights() directly.
+        This calls AsyncActorRolloutRefWorker.update_weights() →
+        rollout_mode() which correctly handles LoRA via collect_lora_params()
+        and broadcasts FSDP weights to vLLM.
+
+        (The comment in the old _wake_up_rollout() said this didn't work for
+        LoRA — that was incorrect.  rollout_mode() uses collect_lora_params()
+        and passes peft_config to rollout.update_weights(), which handles the
+        name mapping properly.)
+        """
+        import logging
+        _logger = logging.getLogger(__name__)
+        try:
+            self.checkpoint_manager.update_weights(global_steps=self.global_steps)
+            _logger.info(f"[WeightSync] FSDP → vLLM weight sync completed at step {self.global_steps}.")
+        except Exception as exc:
+            _logger.warning(
+                f"[WeightSync] checkpoint_manager.update_weights() failed: {exc}. "
+                "vLLM will use its current weights (pretrained if load_format=auto)."
+            )
+
+    def _wake_up_rollout(self):
+        """Wake up vLLM inference server before agent rollout.
+
+        Old verl: async_rollout_manager.wake_up() resumed the sleeping server
+        and synced actor weights to vLLM.
+
+        New verl (AgentLoopManager): the server is always running; weight sync
+        is now handled explicitly by _sync_weights_to_rollout().
+        """
+        if hasattr(self.async_rollout_manager, 'wake_up'):
+            self.async_rollout_manager.wake_up()
+        # else: new AgentLoopManager — no-op; server is always running
+
+    def _sleep_rollout(self):
+        """Release inference server resources after agent rollout.
+
+        Old verl: async_rollout_manager.sleep() freed GPU memory.
+        New verl: no explicit sleep needed; skipping sleep_replicas() to avoid
+        putting the server into an unusable state between steps.
+        """
+        if hasattr(self.async_rollout_manager, 'sleep'):
+            self.async_rollout_manager.sleep()
+        # else: new AgentLoopManager — no-op
+
     def _validate(self):
         assert len(self.val_dataloader) == 1, "Please set val_batch_size to None for better throughput."
 
@@ -92,7 +156,8 @@ class AgentFlowTrainer(RayPPOTrainer):
 
         test_batch = DataProto.from_single_dict(test_data)
         # test_batch.non_tensor_batch["step"] = np.ones_like(test_batch.non_tensor_batch["question"]) * self.global_steps
-        self.async_rollout_manager.wake_up()
+        self._sync_weights_to_rollout()
+        self._wake_up_rollout()
         self.agent_mode_daemon.set_up_data_and_server(
             test_batch.non_tensor_batch,
             self.async_rollout_manager.server_addresses,
@@ -132,7 +197,7 @@ class AgentFlowTrainer(RayPPOTrainer):
         test_metrics = self.agent_mode_daemon.get_test_metrics()
 
         self.agent_mode_daemon.clear_data_and_server()
-        self.async_rollout_manager.sleep()
+        self._sleep_rollout()
         return test_metrics
 
     def _train_step(self, batch_dict: dict) -> dict:
@@ -166,7 +231,8 @@ class AgentFlowTrainer(RayPPOTrainer):
             # generate a batch
             with _timer("gen", timing_raw):
                 # gen_batch.non_tensor_batch["step"] = np.ones_like(gen_batch.non_tensor_batch["question"]) * self.global_steps
-                self.async_rollout_manager.wake_up()
+                self._sync_weights_to_rollout()
+                self._wake_up_rollout()
                 self.agent_mode_daemon.set_up_data_and_server(
                     gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses
                 )
@@ -186,7 +252,14 @@ class AgentFlowTrainer(RayPPOTrainer):
                 )
                 metrics.update(agent_metrics)
                 self.agent_mode_daemon.clear_data_and_server()
-                self.async_rollout_manager.sleep()
+                self._sleep_rollout()
+
+                if batch is None:
+                    raise ValueError(
+                        "get_train_data_batch() returned None — all rollout triplets had empty token_ids. "
+                        "Check that rollout workers are returning Rollout objects with valid token_ids "
+                        "(prompt_ids and response_ids must be non-empty)."
+                    )
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
@@ -330,6 +403,8 @@ class AgentFlowTrainer(RayPPOTrainer):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
+                # sync updated weights to vLLM so next rollout uses the current policy
+                self._sync_weights_to_rollout()
 
         # compute training metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
